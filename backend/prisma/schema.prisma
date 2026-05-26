@@ -1,0 +1,865 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// ORGANIZATION (Multi-tenant hazırlığı)
+// ==========================================
+model Organization {
+  id          String    @id @default(cuid())
+  name        String
+  slug        String    @unique
+  logo        String?
+  address     String?
+  phone       String?
+  taxNumber   String?
+  taxOffice   String?
+  settings    Json      @default("{}")
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  users       User[]
+  orders      Order[]
+  contacts    Contact[]
+  accounts    Account[]
+  invoices    Invoice[]
+
+  @@map("organizations")
+}
+
+// ==========================================
+// CONTACT (Müşteri + Tedarikçi — Tek tablo)
+// T: Tedarikçi, M: Müşteri
+// ==========================================
+model Contact {
+  id              String    @id @default(cuid())
+  organizationId  String
+  type            String    // CUSTOMER (M), SUPPLIER (T)
+  name            String
+  contactPerson   String?
+  email           String?
+  phone           String?
+  address         String?
+  city            String?
+  country         String?
+  taxNumber       String?
+  taxOffice       String?
+  notes           String?
+  isActive        Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  orders          Order[]
+  procurementItems ProcurementItem[]
+  accounts        Account[]
+
+  @@index([organizationId])
+  @@index([type])
+  @@map("contacts")
+}
+
+// ==========================================
+// USER
+// ==========================================
+model User {
+  id              String    @id @default(cuid())
+  organizationId  String
+  email           String    @unique
+  password        String
+  firstName       String
+  lastName        String
+  phone           String?
+  avatar          String?
+  isActive        Boolean   @default(true)
+  lastLoginAt     DateTime?
+  refreshToken    String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  userRoles       UserRole[]
+  assignments     OrderAssignment[]
+  createdOrders   Order[]          @relation("CreatedBy")
+  timelineEvents  TimelineEvent[]
+  notifications   Notification[]
+  auditLogs       AuditLog[]
+  comments        OrderComment[]
+  issueComments   IssueComment[]
+  resolvedIssues  Issue[]          @relation("ResolvedBy")
+
+  @@index([organizationId])
+  @@map("users")
+}
+
+// ==========================================
+// RBAC — Role & Permission
+// ==========================================
+model Role {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  displayName String
+  description String?
+  isSystem    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  userRoles       UserRole[]
+  rolePermissions RolePermission[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String @id @default(cuid())
+  name        String @unique    // order:create, order:read, etc.
+  module      String            // order, user, report, etc.
+  action      String            // create, read, update, delete, transition
+  description String?
+
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+}
+
+model UserRole {
+  id     String @id @default(cuid())
+  userId String
+  roleId String
+
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roleId])
+  @@map("user_roles")
+}
+
+model RolePermission {
+  id           String @id @default(cuid())
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+// ==========================================
+// WORKFLOW — State & Transition Definitions
+// ==========================================
+model WorkflowState {
+  id          String  @id @default(cuid())
+  code        String  @unique
+  name        String            // Türkçe görünüm adı
+  description String?
+  color       String            // UI renk kodu (#hex)
+  icon        String?           // Lucide icon name
+  sortOrder   Int
+  isInitial   Boolean @default(false)
+  isFinal     Boolean @default(false)
+
+  orders          Order[]
+  fromTransitions WorkflowTransitionDef[] @relation("FromState")
+  toTransitions   WorkflowTransitionDef[] @relation("ToState")
+
+  @@map("workflow_states")
+}
+
+model WorkflowTransitionDef {
+  id               String   @id @default(cuid())
+  fromStateId      String
+  toStateId        String
+  name             String            // "Maliyetlere Geç", "Kesim Tamamlandı"
+  description      String?
+  requiredRoles    String[]          // Bu geçişi yapabilecek roller
+  requiresPhoto    Boolean  @default(false)
+  requiresNote     Boolean  @default(false)
+  requiresApproval Boolean  @default(false)
+  autoAssignRole   String?           // Geçiş sonrası otomatik atanacak rol
+  sortOrder        Int      @default(0)
+
+  fromState WorkflowState @relation("FromState", fields: [fromStateId], references: [id])
+  toState   WorkflowState @relation("ToState", fields: [toStateId], references: [id])
+
+  @@unique([fromStateId, toStateId])
+  @@map("workflow_transition_defs")
+}
+
+// ==========================================
+// ORDER (Sipariş — Ana Entity)
+// ==========================================
+model Order {
+  id               String    @id @default(cuid())
+  organizationId   String
+  orderNumber      String    @unique    // SIP-2026-00001
+  currentStateId   String
+  createdById      String
+  contactId        String?             // Müşteri (Contact type=CUSTOMER)
+
+  // Ürün Bilgileri
+  productName      String
+  productCode      String?
+  description      String?
+  quantity         Int
+  unit             String    @default("adet")
+  colors           String?
+  sizes            String?
+  fabricType       String?
+  fabricComposition String?
+
+  // Termin & Öncelik
+  deadline         DateTime?
+  priority         Int       @default(2)  // 1: Acil, 2: Normal, 3: Düşük
+
+  // İhracat / İç Piyasa
+  marketType       String    @default("DOMESTIC") // DOMESTIC (İç Piyasa), EXPORT (İhracat)
+  vatRate          Int       @default(10)          // 0, 1, 10, 20 — İhracatta 0
+
+  // QR/Barkod
+  qrCode           String?
+  barcode          String?
+
+  // Para Birimi
+  currency         String    @default("TRY")  // TRY, EUR, USD, GBP
+
+  // Maliyet & Fiyat (Hesaplanan toplamlar)
+  totalCost        Decimal?  @db.Decimal(12,2)  // Toplam maliyet
+  unitCost         Decimal?  @db.Decimal(12,2)  // Birim maliyet
+  companyExpenses  Decimal?  @db.Decimal(12,2)  // Şirket giderleri toplamı
+  profitAmount     Decimal?  @db.Decimal(12,2)  // Kâr tutarı
+  profitMargin     Decimal?  @db.Decimal(5,2)   // Kâr marjı (%)
+  offerUnitPrice   Decimal?  @db.Decimal(12,2)  // Müşteriye birim teklif fiyatı
+  offerTotalPrice  Decimal?  @db.Decimal(12,2)  // Müşteriye toplam teklif fiyatı
+
+  // Onay Bilgileri
+  customerApprovalDate DateTime?
+  customerApprovalNote String?
+  orderApprovalDate    DateTime?
+  orderApprovalNote    String?
+
+  // Fatura & İrsaliye (Satış — Çıkış)
+  salesInvoiceNo     String?
+  salesInvoiceDate   DateTime?
+  salesInvoiceAmount Decimal?  @db.Decimal(12,2)
+  dispatchNoteNo     String?
+  dispatchNoteDate   DateTime?
+
+  metadata         Json      @default("{}")
+  isActive         Boolean   @default(true)
+  completedAt      DateTime?
+  cancelledAt      DateTime?
+  cancelReason     String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  deletedAt        DateTime?
+
+  // Relations
+  organization     Organization @relation(fields: [organizationId], references: [id])
+  currentState     WorkflowState @relation(fields: [currentStateId], references: [id])
+  createdBy        User @relation("CreatedBy", fields: [createdById], references: [id])
+  contact          Contact? @relation(fields: [contactId], references: [id])
+
+  assignments      OrderAssignment[]
+  transitions      WorkflowTransition[]
+  costItems        CostItem[]
+  pricingItems     PricingItem[]
+  sampleRecords    SampleRecord[]
+  sampleCritiques  SampleCritique[]
+  procurementItems ProcurementItem[]
+  patternInfo      PatternInfo[]
+  measurementSets  MeasurementSet[]
+  cuttingRecords   CuttingRecord[]
+  productionRecords ProductionRecord[]
+  ironingPackingRecords IroningPackingRecord[]
+  shippingRecords  ShippingRecord[]
+  invoices         Invoice[]
+  timelineEvents   TimelineEvent[]
+  issues           Issue[]
+  files            FileAttachment[]
+  comments         OrderComment[]
+  notifications    Notification[]
+
+  @@index([organizationId])
+  @@index([currentStateId])
+  @@index([orderNumber])
+  @@index([contactId])
+  @@index([deadline])
+  @@index([marketType])
+  @@map("orders")
+}
+
+// ==========================================
+// ORDER ASSIGNMENT
+// ==========================================
+model OrderAssignment {
+  id          String    @id @default(cuid())
+  orderId     String
+  userId      String
+  roleCode    String
+  assignedAt  DateTime  @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+  notes       String?
+
+  order       Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  user        User  @relation(fields: [userId], references: [id])
+
+  @@index([orderId])
+  @@index([userId])
+  @@map("order_assignments")
+}
+
+// ==========================================
+// WORKFLOW TRANSITION LOG
+// ==========================================
+model WorkflowTransition {
+  id            String   @id @default(cuid())
+  orderId       String
+  fromStateCode String
+  toStateCode   String
+  performedById String
+  note          String?
+  metadata      Json     @default("{}")
+  createdAt     DateTime @default(now())
+
+  order         Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("workflow_transitions")
+}
+
+// ==========================================
+// COST ITEM (Maliyet Kalemi)
+// ==========================================
+model CostItem {
+  id          String   @id @default(cuid())
+  orderId     String
+  category    String   // FABRIC, ACCESSORY, CUTTING_LABOR, SEWING_LABOR,
+                       // IRONING_PACKING, LOGISTICS, WASTE, THREAD, LABEL, OTHER
+  name        String
+  description String?
+  quantity    Decimal  @db.Decimal(10,3)
+  unit        String   // metre, kg, adet, saat, takım
+  unitPrice   Decimal  @db.Decimal(10,4)
+  totalPrice  Decimal  @db.Decimal(12,2)
+  currency    String   @default("TRY")
+  notes       String?
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  order       Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("cost_items")
+}
+
+// ==========================================
+// PRICING ITEM (Fiyatlandırma Kalemi)
+// Maliyet üzerine eklenen: şirket giderleri, kâr marjı vs.
+// ==========================================
+model PricingItem {
+  id           String   @id @default(cuid())
+  orderId      String
+  category     String   // COMPANY_EXPENSE, PROFIT_MARGIN, DISCOUNT, OTHER
+  name         String
+  description  String?
+  amount       Decimal  @db.Decimal(12,2)
+  isPercentage Boolean  @default(false)
+  percentage   Decimal? @db.Decimal(5,2)
+  currency     String   @default("TRY")
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  order        Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("pricing_items")
+}
+
+// ==========================================
+// SAMPLE (Numune)
+// ==========================================
+model SampleRecord {
+  id          String    @id @default(cuid())
+  orderId     String
+  sampleNo    Int       // 1, 2, 3... (iterasyon)
+  status      String    @default("IN_PROGRESS") // IN_PROGRESS, COMPLETED, APPROVED, REJECTED
+  notes       String?
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+  approvedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  order       Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("sample_records")
+}
+
+// ==========================================
+// SAMPLE CRITIQUE (Numune Kritik/Revizyon)
+// ==========================================
+model SampleCritique {
+  id          String    @id @default(cuid())
+  orderId     String
+  title       String
+  description String
+  category    String    // MEASUREMENT, COLOR, FABRIC, SEWING, DESIGN, FIT, OTHER
+  status      String    @default("OPEN") // OPEN, IN_PROGRESS, RESOLVED
+  resolution  String?
+  resolvedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  order       Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("sample_critiques")
+}
+
+// ==========================================
+// PATTERN (Kalıp / Modelist)
+// Numune kalıbı (sipariş onayı öncesi) ve Üretim kalıbı (sipariş onayı sonrası)
+// ==========================================
+model PatternInfo {
+  id             String   @id @default(cuid())
+  orderId        String
+  type           String   // SAMPLE (Numune Kalıbı), PRODUCTION (Üretim Kalıbı)
+  modelistName   String?
+  fabricUsagePerUnit Decimal? @db.Decimal(10,4) // 1 adet ürün için kaç metre kumaş
+  patternNotes   String?
+  technicalNotes String?
+  metadata       Json     @default("{}")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  order          Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("pattern_info")
+}
+
+// ==========================================
+// MEASUREMENT SET & ENTRY (Ölçü Tablosu)
+// Beden bazlı ölçüler
+// ==========================================
+model MeasurementSet {
+  id          String   @id @default(cuid())
+  orderId     String
+  size        String   // XS, S, M, L, XL, XXL veya 36, 38, 40...
+  quantity    Int      // Bu bedenden kaç adet
+  sortOrder   Int      @default(0)
+
+  entries     MeasurementEntry[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  order       Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("measurement_sets")
+}
+
+model MeasurementEntry {
+  id               String  @id @default(cuid())
+  measurementSetId String
+  name             String  // Göğüs, Bel, Kalça, Boy, Kol Boyu, Omuz, Yaka...
+  value            Decimal @db.Decimal(8,2)
+  unit             String  @default("cm")
+  tolerance        Decimal? @db.Decimal(5,2) // ± tolerans değeri
+
+  measurementSet   MeasurementSet @relation(fields: [measurementSetId], references: [id], onDelete: Cascade)
+
+  @@index([measurementSetId])
+  @@map("measurement_entries")
+}
+
+// ==========================================
+// PROCUREMENT (Tedarik)
+// ==========================================
+model ProcurementItem {
+  id           String    @id @default(cuid())
+  orderId      String
+  contactId    String?   // Tedarikçi (Contact type=SUPPLIER)
+  category     String    // FABRIC, ACCESSORY, THREAD, LABEL, PACKAGING, ZIPPER, BUTTON, OTHER
+  name         String
+  description  String?
+  quantity     Decimal   @db.Decimal(10,3)
+  unit         String
+  unitPrice    Decimal?  @db.Decimal(10,4)
+  totalPrice   Decimal?  @db.Decimal(12,2)
+  currency     String    @default("TRY")
+  status       String    @default("PENDING") // PENDING, ORDERED, PARTIAL, RECEIVED, CANCELLED
+  orderedAt    DateTime?
+  expectedAt   DateTime?
+  receivedAt   DateTime?
+  receivedQty  Decimal?  @db.Decimal(10,3)
+  notes        String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  order        Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  contact      Contact? @relation(fields: [contactId], references: [id])
+
+  @@index([orderId])
+  @@index([contactId])
+  @@map("procurement_items")
+}
+
+// ==========================================
+// CUTTING (Kesim)
+// ==========================================
+model CuttingRecord {
+  id           String    @id @default(cuid())
+  orderId      String
+  assignedTo   String?
+  layCount     Int?              // Pastal sayısı
+  markerLength Decimal?  @db.Decimal(8,2)  // Pastal boyu (metre)
+  fabricUsed   Decimal?  @db.Decimal(10,2) // Kullanılan kumaş (metre)
+  wasteAmount  Decimal?  @db.Decimal(10,2) // Fire miktarı
+  wastePercent Decimal?  @db.Decimal(5,2)  // Fire oranı (%)
+  cutQuantity  Int?              // Kesilen adet
+  notes        String?
+  status       String    @default("PENDING") // PENDING, IN_PROGRESS, COMPLETED
+  startedAt    DateTime?
+  completedAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  order        Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("cutting_records")
+}
+
+// ==========================================
+// PRODUCTION (Üretim / Dikim)
+// ==========================================
+model ProductionRecord {
+  id                String    @id @default(cuid())
+  orderId           String
+  assignedTo        String?
+  productionLine    String?
+  dailyTarget       Int?
+  completedQuantity Int       @default(0)
+  defectQuantity    Int       @default(0)
+  notes             String?
+  status            String    @default("PENDING") // PENDING, IN_PROGRESS, COMPLETED
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  order             Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("production_records")
+}
+
+// ==========================================
+// IRONING & PACKING (Ütü & Paketleme)
+// ==========================================
+model IroningPackingRecord {
+  id                String    @id @default(cuid())
+  orderId           String
+  assignedTo        String?
+  ironedQuantity    Int       @default(0)
+  packedQuantity    Int       @default(0)
+  packageCount      Int?
+  boxCount          Int?
+  notes             String?
+  status            String    @default("PENDING") // PENDING, IN_PROGRESS, COMPLETED
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  order             Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("ironing_packing_records")
+}
+
+// ==========================================
+// SHIPPING (Sevkiyat)
+// ==========================================
+model ShippingRecord {
+  id              String    @id @default(cuid())
+  orderId         String
+  shippingMethod  String?   // CARGO, COURIER, SELF_PICKUP, CONTAINER
+  trackingNo      String?
+  packageCount    Int?
+  totalWeight     Decimal?  @db.Decimal(10,2)
+  shippingAddress String?
+  shippingCost    Decimal?  @db.Decimal(12,2)
+  notes           String?
+  shippedAt       DateTime?
+  deliveredAt     DateTime?
+  status          String    @default("PENDING") // PENDING, SHIPPED, DELIVERED
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  order           Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("shipping_records")
+}
+
+// ==========================================
+// INVOICE (Fatura Bilgi Girişi — Basit)
+// Fatura kesilmez, sadece bilgi girilir
+// ==========================================
+model Invoice {
+  id              String    @id @default(cuid())
+  organizationId  String
+  orderId         String?
+  accountId       String?
+  type            String    // PURCHASE (Alım Faturası), SALES (Satış Faturası)
+  invoiceNo       String
+  invoiceDate     DateTime
+  subtotal        Decimal   @db.Decimal(12,2) // Tutar (KDV hariç)
+  vatRate         Int       @default(10)      // 1, 10, 20
+  vatAmount       Decimal   @db.Decimal(12,2) // KDV tutarı
+  totalAmount     Decimal   @db.Decimal(12,2) // Toplam (KDV dahil)
+  currency        String    @default("TRY")
+  description     String?
+  category        String?   // FABRIC, ACCESSORY, SERVICE, PRODUCT_SALE, OTHER
+  notes           String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  order           Order?       @relation(fields: [orderId], references: [id])
+  account         Account?     @relation(fields: [accountId], references: [id])
+
+  @@index([organizationId])
+  @@index([orderId])
+  @@index([accountId])
+  @@index([invoiceNo])
+  @@map("invoices")
+}
+
+// ==========================================
+// ACCOUNT (Cari Hesap)
+// Tek sayfada: T = Tedarikçi, M = Müşteri
+// ==========================================
+model Account {
+  id              String    @id @default(cuid())
+  organizationId  String
+  contactId       String?   // Contact'a bağlı
+  name            String
+  type            String    // CUSTOMER (M), SUPPLIER (T)
+  balance         Decimal   @default(0) @db.Decimal(12,2)
+  currency        String    @default("TRY")
+  notes           String?
+  isActive        Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  contact         Contact?     @relation(fields: [contactId], references: [id])
+  transactions    AccountTransaction[]
+  invoices        Invoice[]
+
+  @@index([organizationId])
+  @@index([contactId])
+  @@index([type])
+  @@map("accounts")
+}
+
+model AccountTransaction {
+  id          String   @id @default(cuid())
+  accountId   String
+  type        String   // INVOICE (Fatura), PAYMENT (Ödeme), COLLECTION (Tahsilat)
+  direction   String   // DEBIT (Borç), CREDIT (Alacak)
+  amount      Decimal  @db.Decimal(12,2)
+  currency    String   @default("TRY")
+  description String?
+  referenceNo String?
+  date        DateTime
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  account     Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId])
+  @@index([date])
+  @@map("account_transactions")
+}
+
+// ==========================================
+// ISSUE (Kritik / Sorun — Genel)
+// ==========================================
+model Issue {
+  id           String    @id @default(cuid())
+  orderId      String
+  reportedById String
+  resolvedById String?
+  title        String
+  description  String
+  category     String    // FABRIC, ACCESSORY, MEASUREMENT, PRINT, SEWING, QUALITY, OTHER
+  priority     Int       @default(2)
+  status       String    @default("OPEN") // OPEN, IN_PROGRESS, RESOLVED, CLOSED
+  resolution   String?
+  resolvedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  order        Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  resolvedBy   User? @relation("ResolvedBy", fields: [resolvedById], references: [id])
+  files        FileAttachment[]
+  comments     IssueComment[]
+
+  @@index([orderId])
+  @@index([status])
+  @@map("issues")
+}
+
+model IssueComment {
+  id        String   @id @default(cuid())
+  issueId   String
+  userId    String
+  content   String
+  createdAt DateTime @default(now())
+
+  issue     Issue @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  user      User  @relation(fields: [userId], references: [id])
+
+  @@map("issue_comments")
+}
+
+// ==========================================
+// FILE ATTACHMENT
+// ==========================================
+model FileAttachment {
+  id           String   @id @default(cuid())
+  orderId      String?
+  issueId      String?
+  uploadedById String
+  fileName     String
+  originalName String
+  mimeType     String
+  size         Int      // bytes
+  bucket       String
+  key          String   // MinIO object key
+  url          String?
+  category     String?  // SAMPLE, TECHNICAL, QUALITY, PATTERN, DOCUMENT, PHOTO
+  createdAt    DateTime @default(now())
+  deletedAt    DateTime?
+
+  order        Order? @relation(fields: [orderId], references: [id])
+  issue        Issue? @relation(fields: [issueId], references: [id])
+
+  @@index([orderId])
+  @@index([issueId])
+  @@map("file_attachments")
+}
+
+// ==========================================
+// TIMELINE EVENT
+// ==========================================
+model TimelineEvent {
+  id          String   @id @default(cuid())
+  orderId     String
+  userId      String
+  eventType   String   // STATE_CHANGE, COMMENT, FILE_UPLOAD, ISSUE, ASSIGNMENT,
+                       // COST_UPDATE, SAMPLE, CRITIQUE, PROCUREMENT, APPROVAL,
+                       // PATTERN, CUTTING, PRODUCTION, IRONING, SHIPPING, INVOICE
+  title       String
+  description String?
+  metadata    Json     @default("{}")
+  createdAt   DateTime @default(now())
+
+  order       Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  user        User  @relation(fields: [userId], references: [id])
+
+  @@index([orderId])
+  @@index([createdAt])
+  @@map("timeline_events")
+}
+
+// ==========================================
+// ORDER COMMENT
+// ==========================================
+model OrderComment {
+  id        String    @id @default(cuid())
+  orderId   String
+  userId    String
+  content   String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  order     Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  user      User  @relation(fields: [userId], references: [id])
+
+  @@index([orderId])
+  @@map("order_comments")
+}
+
+// ==========================================
+// NOTIFICATION
+// ==========================================
+model Notification {
+  id          String    @id @default(cuid())
+  userId      String
+  orderId     String?
+  type        String
+  title       String
+  body        String
+  isRead      Boolean   @default(false)
+  readAt      DateTime?
+  channel     String    @default("IN_APP")
+  metadata    Json      @default("{}")
+  createdAt   DateTime  @default(now())
+
+  user        User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order       Order? @relation(fields: [orderId], references: [id])
+
+  @@index([userId, isRead])
+  @@index([orderId])
+  @@map("notifications")
+}
+
+// ==========================================
+// AUDIT LOG
+// ==========================================
+model AuditLog {
+  id          String   @id @default(cuid())
+  userId      String
+  action      String   // CREATE, UPDATE, DELETE, TRANSITION, LOGIN, LOGOUT
+  entity      String   // Order, User, Invoice, etc.
+  entityId    String
+  oldValue    Json?
+  newValue    Json?
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  user        User @relation(fields: [userId], references: [id])
+
+  @@index([entity, entityId])
+  @@index([userId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
