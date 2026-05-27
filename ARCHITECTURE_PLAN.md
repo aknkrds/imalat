@@ -19,6 +19,8 @@ graph TD
     BE -->|MinIO SDK| S3[(MinIO Object Storage)]
 ```
 
+![Genel Sistem Mimarisi Şeması](./docs/images/system_architecture.png)
+
 ---
 
 ## 2. Mimari Katmanlar ve Modüller
@@ -112,6 +114,8 @@ erDiagram
     ISSUE ||--o{ ISSUE_COMMENT : contains
     USER ||--o{ ISSUE_COMMENT : writes
 ```
+
+![Veritabanı İlişkisel Şeması (ERD)](./docs/images/database_erd.png)
 
 ---
 
